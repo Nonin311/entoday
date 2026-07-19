@@ -1,0 +1,138 @@
+================================================================================
+  两个核心代码打包说明
+  日期: 2026-07-19
+================================================================================
+
+一、两个核心代码文件
+--------------------------------------------------------------------------------
+
+  文件                                  作用                                         大小
+  ──────────────────────────────────────────────────────────────────────────────────────
+  shape_designer.py                     标准框图几何元设计器 — 自定义设计流程图形状    ~41KB
+                                        （矩形、椭圆、六边形等），导出为 JSON 标准库
+
+  grid_flowchart_designer_3.2.py        网格逻辑流程图设计器 — 在网格上编排节点和连线  ~74KB
+                                        生成完整流程图，导出 SVG/PNG/PDF
+
+  两者的关系：
+    它们是互相独立的程序，既不 import 对方，也没有代码级耦合。
+    关联是数据层面的 — shape_designer 导出 .json 形状配置文件
+    → grid_flowchart_designer 导入这些 JSON 来使用自定义形状。
+
+
+二、打包带走需要复制的文件
+--------------------------------------------------------------------------------
+
+  最小复制清单（两个程序都独立运行）：
+
+    grid_flowchart_designer_3.2.py  ← 核心程序1
+    shape_designer.py               ← 核心程序2
+
+  就这两个 .py 文件就够了。其他文件夹和文件的情况：
+
+    文件/文件夹                          说明                              需要复制吗？
+    ──────────────────────────────────────────────────────────────────────────────────
+    BLOCK_4.json                         示例形状配置文件                   可选
+    grid_flowchart_designer_3.2_调用说明.txt  外部 API 调用文档              可选参考
+    dist/                                空目录，可能之前打包用的             不需要
+    logs/                                开发日志，历史记录                   不需要
+    prompt/                              AI 对话 prompt 存档                不需要
+    .claude/                             Claude Code 配置                   不需要
+    .venv/                               Python 虚拟环境                    不需要
+    __pycache__/                         Python 缓存                       不需要
+
+  在新电脑上运行前需要安装 Python 依赖：
+
+    pip install Pillow svgwrite
+
+  tkinter 是 Python 标准库自带的，无需额外安装。
+
+
+三、打包成 EXE 的注意事项
+--------------------------------------------------------------------------------
+
+  1. 中文字体路径是硬编码的！（最大的坑）
+
+    grid_flowchart_designer_3.2.py 第 1107-1113 行硬编码了 Windows 字体路径：
+
+      "C:/Windows/Fonts/msyh.ttc",    # 微软雅黑
+      "C:/Windows/Fonts/simhei.ttf",   # 黑体
+      "C:/Windows/Fonts/simsun.ttc",   # 宋体
+
+    打包成 EXE 后，如果目标电脑没有这些字体（如英文版 Windows、Win7 精简版、
+    或非 Windows 系统），PNG/PDF 导出会失败或乱码。
+
+    shape_designer.py 用的是 "arial.ttf"，同样有字体路径问题。
+
+    建议：打包时把字体文件一起放进 EXE，或使用 --add-data 把字体文件嵌入。
+
+  2. Tkinter 的打包配置
+
+    两个程序都是 Tkinter GUI，用 PyInstaller 打包时需要确保 tkinter 被正确包含：
+
+      pyinstaller --onefile --windowed \
+        --hidden-import=tkinter \
+        --hidden-import=PIL \
+        --hidden-import=svgwrite \
+        grid_flowchart_designer_3.2.py
+
+    --windowed：不显示命令行黑窗口（纯 GUI 程序）
+    --hidden-import=svgwrite：grid_flowchart_designer_3.2.py 是懒加载 svgwrite
+      （只在 save_svg 时才 import），PyInstaller 可能检测不到，必须手动声明
+
+  3. 两个程序打包成两个独立 EXE
+
+    它们互相独立，分开打包即可，不需要合并：
+
+      grid_flowchart_designer.exe   ← 流程图设计器
+      shape_designer.exe             ← 形状设计器
+
+    用户先用 shape_designer.exe 设计形状并导出 JSON，
+    再用 grid_flowchart_designer.exe 导入 JSON 来画流程图。
+
+  4. 其他注意事项
+
+    问题                    说明
+    ──────────────────────────────────────────────────────────────────────────────────
+    Pillow 版本             建议 >= 9.0，否则 PDF 导出可能异常
+    svgwrite 版本           建议 >= 1.4
+    线程安全                两个程序都基于 Tkinter，不是线程安全的，EXE 中也不要
+                            在多线程调用
+    tk.StringVar 生命周期   无头调用时 root.destroy() 必须在所有 save_xxx() 之后
+                            详见 grid_flowchart_designer_3.2_调用说明.txt 第八节
+    PyInstaller 打包体积     tkinter + Pillow + svgwrite 打包后单个 EXE 约 30-50MB
+                            两个约 60-100MB
+
+  5. PyInstaller 打包命令参考
+
+    :: 打包 shape_designer
+    pyinstaller --onefile --windowed ^
+      --hidden-import=tkinter ^
+      --hidden-import=PIL ^
+      --hidden-import=svgwrite ^
+      --name shape_designer ^
+      shape_designer.py
+
+    :: 打包 grid_flowchart_designer
+    pyinstaller --onefile --windowed ^
+      --hidden-import=tkinter ^
+      --hidden-import=PIL ^
+      --hidden-import=svgwrite ^
+      --name grid_flowchart_designer ^
+      grid_flowchart_designer_3.2.py
+
+    :: 如果需要嵌入字体文件（推荐）
+    pyinstaller --onefile --windowed ^
+      --hidden-import=tkinter ^
+      --hidden-import=PIL ^
+      --hidden-import=svgwrite ^
+      --add-data "C:/Windows/Fonts/msyh.ttc;fonts" ^
+      --add-data "C:/Windows/Fonts/simhei.ttf;fonts" ^
+      --add-data "C:/Windows/Fonts/simsun.ttc;fonts" ^
+      --name grid_flowchart_designer ^
+      grid_flowchart_designer_3.2.py
+
+    （注意：嵌入字体后还需修改代码中的字体路径指向内嵌资源，
+     使用 sys._MEIPASS 获取 PyInstaller 临时解压目录。）
+
+================================================================================

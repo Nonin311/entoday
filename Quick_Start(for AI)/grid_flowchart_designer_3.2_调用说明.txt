@@ -1,0 +1,483 @@
+================================================================================
+  grid_flowchart_designer_3.py  外部代码调用说明文档
+  版本: v3.2  |  更新日期: 2025-07-19
+================================================================================
+
+本文档说明如何从其他 Python 脚本调用本模块，实现自动化流程图生成与导出。
+目标读者：AI 智能体、自动化脚本编写者。
+
+================================================================================
+零、关键警告（必读，否则可能导致调用失败）
+================================================================================
+
+!! 警告 1: Tk 根窗口必须在所有导出操作完成后才能 destroy !!
+
+    错误示例（会导致 RuntimeError）:
+        root.destroy()
+        app.save_svg("out.svg")   # ❌ 崩溃！StringVar 依赖已销毁的 Tk
+
+    正确示例:
+        app.save_svg("out.svg")
+        app.save_png("out.png")
+        root.destroy()            # ✅ 所有操作完成后最后销毁
+
+    原因: save_svg / save_png / save_pdf / load_csv 内部会访问 tk.StringVar，
+    这些对象在 root.destroy() 后失效，调用 .get() 或 .set() 会抛出 RuntimeError。
+
+!! 警告 2: 参数默认值以代码中 tk.StringVar 的初始值为准 !!
+
+    _get_xxx() 方法中的 try/except 兜底值仅在 StringVar 读取失败（如值被设
+    为非数字字符串）时生效，正常运行时不会触发。文档第五节列出的值已被核验
+    为代码实际默认值。
+
+!! 警告 3: 直接修改 app.grid_bounds 不会同步 UI 的 StringVar !!
+
+    这在无头（headless）导出场景下不影响使用，因为 export 方法读取的是
+    app.grid_bounds 字典而非 StringVar。但如果你之后调用了 load_csv，
+    load_csv 会用 CSV 中的值覆盖 grid_bounds 并同步 StringVar。
+
+================================================================================
+一、快速开始（最小示例）
+================================================================================
+
+    import tkinter as tk
+    from grid_flowchart_designer_3 import GridFlowchartApp
+
+    # 1. 创建隐藏的 Tk 根窗口（必须）
+    root = tk.Tk()
+    root.withdraw()
+    app = GridFlowchartApp(root)
+    # 注意：__init__ 会自动加载示例数据到 app.nodes / app.connections。
+    # 如果你不需要示例数据，在构造后立即覆盖它们即可。
+
+    # 2. （可选）加载框图形状定义
+    app.load_shape_definitions("my_shapes.json")
+
+    # 3. 加载流程图数据（覆盖示例数据）
+    app.load_csv("my_flowchart.csv")
+
+    # 4. 导出为各种格式（必须在 root.destroy() 之前）
+    app.save_svg("output.svg")
+    app.save_png("output.png")
+    app.save_pdf("output.pdf")
+
+    # 5. 清理（最后一步！）
+    root.destroy()
+
+================================================================================
+二、公开 API（纯逻辑方法，无 GUI 交互）
+================================================================================
+
+以下方法不弹出文件对话框、不显示消息框，适合外部脚本自动化调用。
+所有 filepath 参数接受绝对路径或相对路径。
+
+------------------------------------------------------------------------
+2.1  加载框图形状定义
+------------------------------------------------------------------------
+
+    count = app.load_shape_definitions(filepath)
+
+    参数:
+        filepath (str): JSON 配置文件的路径（通常由 shape_designer 导出）
+    返回:
+        int: 成功加载的形状定义数量（即 JSON 根对象中的 key 数量）
+    异常:
+        FileNotFoundError: 文件不存在
+        json.JSONDecodeError: JSON 语法错误
+        ValueError: JSON 根元素不是字典（如传入了一个 list）
+
+    说明:
+        - 加载后自动覆盖 app.shape_templates 字典
+        - 支持旧版格式（无 bounding_box / extension 字段），
+          _get_shape_meta() 会在首次访问时自动补全
+        - 如果未加载任何 JSON，内置四种形状仍可用：
+          Oval, Rectangle, Hexagon, Octagon
+
+    JSON 文件格式示例（新版完整格式）:
+        {
+            "MyRectangle": {
+                "bounding_box": [-70, -40, 70, 40],
+                "vertices": [[-60,-30],[60,-30],[60,30],[-60,30]],
+                "ports": [
+                    {"name": "N",  "x": 0,  "y": 30,
+                     "extension": {"x": 0,  "y": 45, "direction": "N"}},
+                    {"name": "S",  "x": 0,  "y": -30,
+                     "extension": {"x": 0,  "y": -45, "direction": "S"}},
+                    {"name": "E",  "x": 60, "y": 0,
+                     "extension": {"x": 70, "y": 0, "direction": "E"}},
+                    {"name": "W",  "x": -60, "y": 0,
+                     "extension": {"x": -70, "y": 0, "direction": "W"}}
+                ]
+            }
+        }
+
+    端口命名约定:
+        - 端口名首字母决定方向: N=上, S=下, E=右, W=左
+        - 同方向多端口: N, N1, N2, N3 ...（编号从 1 开始，无编号的排最前）
+        - extension 字段定义端口引出线终点（相对于形状数学坐标原点）
+
+------------------------------------------------------------------------
+2.2  加载流程图 CSV 数据
+------------------------------------------------------------------------
+
+    node_count, conn_count = app.load_csv(filepath)
+
+    参数:
+        filepath (str): CSV 文件的路径
+    返回:
+        tuple (int, int): (节点数量, 连线数量)
+    副作用:
+        - 覆盖 self.grid_bounds, self.nodes, self.connections
+        - 同步 UI StringVar（min_col_var, max_col_var, min_row_var, max_row_var）
+    异常:
+        FileNotFoundError: 文件不存在
+        ValueError: BOUNDS 行的数值无法解析为 int（如 "abc"）
+        （注意：格式不合规的数据行会被静默跳过，不会抛异常）
+
+    CSV 文件格式（与 GUI 导出完全兼容）:
+        BOUNDS,1,8,1,8
+        NODE,n1,开始,Oval,7,2
+        NODE,n2,加载配置,Rectangle,5,2
+        CONN,c1,n1,S,n2,N,启动,
+        CONN,c2,n2,S,n3,N,验证,6,1
+
+    字段说明:
+        BOUNDS: 标记, min_col, max_col, min_row, max_row
+                （定义网格的有效绘制范围）
+        NODE:   标记, node_id, text, shape, row, col
+                （shape 必须是已加载的形状名，否则渲染时回退为 Rectangle）
+        CONN:   标记, conn_id, from_node_id, from_port,
+                to_node_id, to_port, label, [path_points]
+                path_points 为可选字段，格式: "c1,r1;c2,r2"
+                如为空字符串则表示无强制拐点
+
+------------------------------------------------------------------------
+2.3  保存 CSV 数据
+------------------------------------------------------------------------
+
+    app.save_csv(filepath)
+
+    参数:
+        filepath (str): 目标 CSV 文件路径（会覆盖已有文件）
+    异常:
+        PermissionError: 文件被占用或无写入权限
+    说明:
+        - 导出的 CSV 可被 load_csv 完整读回（含 path_points）
+        - 可在 Excel 中编辑后重新导入
+
+------------------------------------------------------------------------
+2.4  导出 SVG 矢量图
+------------------------------------------------------------------------
+
+    app.save_svg(filepath)
+
+    参数:
+        filepath (str): 目标 .svg 文件路径
+    异常:
+        ValueError: 当前 app.nodes 为空（无有效节点可渲染）
+    依赖:
+        pip install svgwrite
+    说明:
+        - 使用当前 export_scale 缩放系数
+        - 节点文字大小受 node_font_size 控制
+        - 连线标签大小受 conn_font_size 和 label_offset 控制
+
+------------------------------------------------------------------------
+2.5  导出 PNG 位图
+------------------------------------------------------------------------
+
+    app.save_png(filepath)
+
+    参数:
+        filepath (str): 目标 .png 文件路径
+    异常:
+        ValueError: 当前 app.nodes 为空
+        ImportError: Pillow 未安装
+    依赖:
+        pip install Pillow
+    说明:
+        - PNG 以当前 _export_setup() 计算的原生尺寸输出（scale=1.0）
+        - 如需更高分辨率，先调大 export_scale，再调用 save_png
+
+------------------------------------------------------------------------
+2.6  导出 A4 PDF (300dpi)
+------------------------------------------------------------------------
+
+    app.save_pdf(filepath)
+
+    参数:
+        filepath (str): 目标 .pdf 文件路径
+    异常:
+        ValueError: 当前 app.nodes 为空
+        ImportError: Pillow 未安装
+    依赖:
+        pip install Pillow
+    说明:
+        - 自动将流程图缩放到 A4 纸张（210×297mm, 12mm 边距）
+        - 如果流程图超出 A4 范围，自动缩小适配（fit_scale）
+        - 输出为 300dpi 位图嵌入 PDF（非矢量）
+
+================================================================================
+三、直接操作数据结构（绕过 CSV）
+================================================================================
+
+你也可以直接写入 app 的数据结构，完全不需要 CSV 文件：
+
+    import tkinter as tk
+    from grid_flowchart_designer_3 import GridFlowchartApp
+
+    root = tk.Tk()
+    root.withdraw()
+    app = GridFlowchartApp(root)
+
+    # --- 直接设置网格边界 ---
+    app.grid_bounds = {"min_col": 1, "max_col": 8, "min_row": 1, "max_row": 8}
+    # 注意: 这不会同步 UI 的 StringVar，但在无头导出场景下无影响
+
+    # --- 直接添加节点 ---
+    # 每个节点: {text, shape, row, col}
+    app.nodes = {
+        "n1": {"text": "开始",       "shape": "Oval",      "row": 7, "col": 2},
+        "n2": {"text": "处理数据",   "shape": "Rectangle", "row": 5, "col": 2},
+        "n3": {"text": "验证通过?",  "shape": "Hexagon",   "row": 3, "col": 2},
+        "n4": {"text": "结束",       "shape": "Oval",      "row": 1, "col": 2},
+    }
+
+    # --- 直接添加连线 ---
+    # 每条连线: {id, from_node_id, from_port, to_node_id, to_port, label, path_points}
+    app.connections = [
+        {"id": "c1", "from_node_id": "n1", "from_port": "S",
+         "to_node_id": "n2", "to_port": "N", "label": "启动", "path_points": []},
+        {"id": "c2", "from_node_id": "n2", "from_port": "S",
+         "to_node_id": "n3", "to_port": "N", "label": "验证", "path_points": []},
+        {"id": "c3", "from_node_id": "n3", "from_port": "S",
+         "to_node_id": "n4", "to_port": "N", "label": "完成", "path_points": []},
+    ]
+
+    # --- 关于 path_points（强制拐点）---
+    # 格式: [(col1, row1), (col2, row2), ...] 的 Python 列表
+    # 每个元素是网格坐标 (列, 行)，连线会强制经过这些点
+    # 注意：强制拐点仅推荐用于人工手动美化，不建议在自动化脚本中使用
+    # 原因：拐点与 BFS 自动路由叠加时可能产生去而复返的回溯路径
+    # 如果有拐点需要设置，建议人工确认路径美观后再写入脚本
+    # 示例: "path_points": [(6, 1), (8, 3)]  表示先经过(6,1)再经过(8,3)
+
+    # --- 直接赋值形状模板（跳过 JSON 文件） ---
+    app.shape_templates = {
+        "CustomBox": {
+            "bounding_box": [-80, -50, 80, 50],
+            "vertices": [[-70,-45],[70,-45],[70,45],[-70,45]],
+            "ports": [
+                {"name": "N", "x": 0, "y": 45,
+                 "extension": {"x": 0, "y": 55, "direction": "N"}},
+                {"name": "S", "x": 0, "y": -45,
+                 "extension": {"x": 0, "y": -55, "direction": "S"}},
+            ]
+        }
+    }
+
+    # --- 调整导出参数（可选） ---
+    app.export_scale.set("2.0")       # 缩放系数
+    app.node_font_size.set("20")      # 节点文字字号
+    app.conn_font_size.set("16")      # 连线文字字号
+    app.label_offset.set("1.5")       # 连线标签偏移
+
+    # --- 导出（必须在 root.destroy() 之前） ---
+    app.save_svg("output.svg")
+    app.save_png("output.png")
+
+    root.destroy()  # 最后一步！
+
+================================================================================
+四、完整工作流示例：JSON + CSV → 三种格式输出
+================================================================================
+
+    """
+    读取 shape_designer 的 JSON 配置 + CSV 流程图数据，
+    批量导出 SVG / PNG / PDF。
+    """
+    import tkinter as tk
+    from grid_flowchart_designer_3 import GridFlowchartApp
+
+    def batch_export(shapes_json, flowchart_csv, output_prefix):
+        root = tk.Tk()
+        root.withdraw()
+        app = GridFlowchartApp(root)
+
+        try:
+            # 加载框图定义
+            shape_count = app.load_shape_definitions(shapes_json)
+            print(f"已加载 {shape_count} 个形状定义")
+
+            # 加载流程图数据
+            node_count, conn_count = app.load_csv(flowchart_csv)
+            print(f"已加载 {node_count} 个节点, {conn_count} 条连线")
+
+            # 导出（必须在 root.destroy() 之前）
+            app.save_svg(f"{output_prefix}.svg")
+            print(f"SVG 已保存: {output_prefix}.svg")
+
+            app.save_png(f"{output_prefix}.png")
+            print(f"PNG 已保存: {output_prefix}.png")
+
+            app.save_pdf(f"{output_prefix}.pdf")
+            print(f"PDF 已保存: {output_prefix}.pdf")
+
+        except Exception as e:
+            print(f"错误: {e}")
+            raise  # 建议重新抛出，让调用方感知失败
+        finally:
+            root.destroy()  # 无论成功或失败，都要销毁 Tk
+
+    # 使用
+    batch_export("shapes.json", "flowchart.csv", "my_flowchart")
+
+================================================================================
+五、导出参数说明
+================================================================================
+
+以下参数通过 tk.StringVar 控制，可在导出前动态调整。
+默认值为代码中 StringVar 的构造初始值（已核验，非兜底值）。
+
+    参数                 默认值    说明
+    ─────────────────────────────────────────────
+    export_scale          2.0      整体缩放系数（越大图形越大/越精细）
+    node_font_size        20       节点文字字号（导出像素）
+    conn_font_size        16       连线标签字号（导出像素）
+    label_offset          1.5      连线标签距线段的偏移比例
+
+    设置方法:
+        app.export_scale.set("2.0")
+        app.node_font_size.set("24")
+
+    获取方法（含兜底）:
+        app._get_export_scale()     → float, 兜底 1.5
+        app._get_node_font_size()   → int,   兜底 11
+        app._get_conn_font_size()   → int,   兜底 9
+        app._get_label_offset()     → float, 兜底 1.2
+        注意: 兜底值仅在 StringVar.get() 返回非数字字符串时生效。
+              正常场景下永远返回 StringVar 中设置的值。
+
+================================================================================
+六、形状类型说明
+================================================================================
+
+内置四种形状（无需导入 JSON 即可使用）：
+
+    名称        显示      用途
+    ─────────────────────────────
+    Oval        ● 起止框   流程开始/结束
+    Rectangle   ■ 处理框   一般处理步骤
+    Hexagon     ⬡ 判断框   条件分支
+    Octagon     ⯃ 输出框   数据输出
+
+端口方向约定:
+    N (North) = ↑  上  → 网格 row + 1
+    S (South) = ↓  下  → 网格 row - 1
+    E (East)  = →  右  → 网格 col + 1
+    W (West)  = ←  左  → 网格 col - 1
+
+自定义端口（如 N1, N2, S1 等）通过 shape_designer 的 JSON 导出定义。
+端口名首字母决定方向，数字后缀用于区分同方向多端口。
+
+================================================================================
+七、数据流与状态管理
+================================================================================
+
+    操作                         grid_bounds  nodes/conns  StringVar(UI)
+    ───────────────────────────  ───────────  ───────────  ─────────────
+    __init__                     示例数据     示例数据     ✅ 已同步
+    load_csv(path)               ✅ 覆盖      ✅ 覆盖     ✅ 自动同步
+    load_shape_definitions(path) 不涉及       shape_templates 不涉及
+    直接赋值 app.nodes = {...}   不涉及       ✅ 覆盖     ❌ 未同步
+    直接赋值 app.grid_bounds      ✅ 覆盖     不涉及      ❌ 未同步
+    直接赋值 app.connections     不涉及       ✅ 覆盖     ❌ 未同步
+    save_csv / save_xxx           只读        只读        只读（export参数）
+
+    关键结论:
+    - 如果只用 load_csv 加载数据 → StringVar 自动同步，无任何问题
+    - 如果直接赋值数据结构 → StringVar 不同步，但对无头导出无影响
+    - 混合使用（先 load_csv，再直接修改个别字段）→ 推荐做法
+
+================================================================================
+八、注意事项
+================================================================================
+
+1. Tk 根窗口必须在所有操作完成后最后销毁
+   root.destroy() 必须放在所有 save_xxx() 和 load_csv() 调用之后。
+   建议使用 try/finally 模式确保销毁（见第四节示例）。
+
+2. Pillow 依赖
+   PNG 和 PDF 导出需要 Pillow 库:
+       pip install Pillow
+   推荐版本 >= 9.0。如果未安装，save_png/save_pdf 会抛出 ImportError。
+
+3. svgwrite 依赖
+   SVG 导出需要 svgwrite 库:
+       pip install svgwrite
+   推荐版本 >= 1.4。如果未安装，import 时会失败。
+
+4. 中文字体
+   PNG/PDF 导出使用 Windows 系统字体路径:
+       C:/Windows/Fonts/msyh.ttc   (微软雅黑)
+       C:/Windows/Fonts/simhei.ttf  (黑体)
+       C:/Windows/Fonts/simsun.ttc  (宋体)
+   在非 Windows 系统上，需修改 _get_cjk_font() 方法中的字体路径，
+   或确保系统安装了上述字体之一。
+
+5. 线程安全
+   本模块基于 Tkinter，不是线程安全的。所有调用必须在同一线程中完成。
+   请勿在多线程环境中并发调用。
+
+6. CSV 格式兼容性
+   save_csv 导出的 CSV 可直接用 load_csv 读回，实现完整闭环。
+   path_points 字段可为空（表示无强制拐点），
+   格式: "col1,row1;col2,row2"（分号分隔，无空格）。
+
+7. 坐标系
+   网格坐标系: col(列/X轴) 向右增加, row(行/Y轴) 向上增加。
+   导出画布原点在左上角，Y 轴向下（与网格 Y 轴方向相反，to_px() 已处理转换）。
+
+================================================================================
+九、方法对照表（GUI 包装 ↔ 纯逻辑）
+================================================================================
+
+    GUI 方法（含文件对话框/消息框）     纯逻辑方法（外部调用，抛异常）
+    ────────────────────────────────    ───────────────────────────────
+    import_shape_definitions()      →   load_shape_definitions(path)
+    import_csv()                    →   load_csv(path)
+    export_csv()                    →   save_csv(path)
+    export_svg()                    →   save_svg(path)
+    export_png()                    →   save_png(path)
+    export_pdf()                    →   save_pdf(path)
+
+    纯逻辑方法抛出异常（不弹消息框），由调用方自行捕获处理。
+    GUI 方法捕获异常并用 messagebox 显示。
+
+================================================================================
+十、强制拐点（path_points）特别说明
+================================================================================
+
+强制拐点存储在每条连线的 path_points 字段中，格式为网格坐标列表。
+
+    数据结构格式:
+        "path_points": [(col1, row1), (col2, row2), ...]
+        例如: [(6, 1)]         → 连线强制经过网格点 (col=6, row=1)
+        例如: [(6, 1), (8, 3)] → 先经过 (6,1)，再经过 (8,3)
+
+    CSV 中的格式:
+        "6,1"       → 单个拐点
+        "6,1;8,3"   → 多个拐点（分号分隔）
+
+    重要建议:
+        ⚠ 强制拐点仅推荐用于人工手动美化流程图。
+        ⚠ 不建议在自动化批量生成脚本中使用 path_points。
+        原因: BFS 自动路由在拐点处可能产生"去而复返"的回溯路径，
+        需要人工确认视觉效果后才能确定合适的拐点坐标。
+
+    技术说明（供参考）:
+        拐点在路径简化过程中被标记为"锚点"（anchors），
+        _cleanup_backtrack() 和 _simplify_path() 不会删除或合并锚点。
+        因此，一旦设置拐点，连线一定会经过该网格坐标。
+
+================================================================================
